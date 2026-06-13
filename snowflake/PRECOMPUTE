@@ -1,0 +1,281 @@
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- OVERWATCH Pre-computation Layer (Dynamic Tables)
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- Run AFTER snowflake/DEPLOY.sql
+-- Requires: Snowflake Enterprise Edition (for Dynamic Tables)
+-- Purpose: Eliminates 80% of ACCOUNT_USAGE scan cost by pre-aggregating data.
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- OVERWATCH Pre-computation Layer (Task + Table pattern)
+-- ═══════════════════════════════════════════════════════════════════════════════
+-- IMPORTANT: Dynamic Tables CANNOT reference SNOWFLAKE.ACCOUNT_USAGE secure
+-- views (they fail with "Error in secure object" during background refresh).
+-- Instead, we use scheduled Tasks that INSERT/MERGE into regular tables.
+-- ═══════════════════════════════════════════════════════════════════════════════
+
+USE DATABASE DBA_MAINT_DB;
+USE SCHEMA OVERWATCH;
+
+-- ─── Drop failed Dynamic Tables ──────────────────────────────────────────────
+DROP DYNAMIC TABLE IF EXISTS DT_DAILY_CREDITS;
+DROP DYNAMIC TABLE IF EXISTS DT_HOURLY_PRESSURE;
+DROP DYNAMIC TABLE IF EXISTS DT_TASK_SUMMARY;
+DROP DYNAMIC TABLE IF EXISTS DT_SERVICE_COSTS;
+DROP DYNAMIC TABLE IF EXISTS DT_QUERY_BOTTLENECKS;
+DROP DYNAMIC TABLE IF EXISTS DT_STORAGE_TREND;
+DROP DYNAMIC TABLE IF EXISTS DT_OVERWATCH_DAILY_CREDITS;
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- SECTION 1: Target tables (regular tables that Tasks refresh)
+-- ═════════════════════════════════════════════════════════════════════════════
+
+CREATE TABLE IF NOT EXISTS OW_DAILY_CREDITS (
+    USAGE_DATE       DATE        NOT NULL,
+    WAREHOUSE_NAME   VARCHAR(256) NOT NULL,
+    COMPUTE_CREDITS  NUMBER(18,4),
+    CLOUD_CREDITS    NUMBER(18,4),
+    TOTAL_CREDITS    NUMBER(18,4),
+    REFRESHED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (USAGE_DATE, WAREHOUSE_NAME)
+);
+
+CREATE TABLE IF NOT EXISTS OW_HOURLY_PRESSURE (
+    WAREHOUSE_NAME   VARCHAR(256) NOT NULL,
+    HOUR_BUCKET      TIMESTAMP_NTZ NOT NULL,
+    HOURLY_CREDITS   NUMBER(18,4),
+    REFRESHED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (WAREHOUSE_NAME, HOUR_BUCKET)
+);
+
+CREATE TABLE IF NOT EXISTS OW_TASK_SUMMARY (
+    RUN_DATE         DATE        NOT NULL,
+    DATABASE_NAME    VARCHAR(256),
+    SCHEMA_NAME      VARCHAR(256),
+    TASK_NAME        VARCHAR(256) NOT NULL,
+    STATE            VARCHAR(50)  NOT NULL,
+    RUN_COUNT        NUMBER,
+    AVG_DURATION_SEC NUMBER(18,2),
+    MAX_DURATION_SEC NUMBER(18,2),
+    REFRESHED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (RUN_DATE, DATABASE_NAME, SCHEMA_NAME, TASK_NAME, STATE)
+);
+
+CREATE TABLE IF NOT EXISTS OW_SERVICE_COSTS (
+    USAGE_DATE       DATE        NOT NULL,
+    SERVICE_TYPE     VARCHAR(100) NOT NULL,
+    TOTAL_CREDITS    NUMBER(18,4),
+    REFRESHED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (USAGE_DATE, SERVICE_TYPE)
+);
+
+CREATE TABLE IF NOT EXISTS OW_QUERY_BOTTLENECKS (
+    HOUR_BUCKET      TIMESTAMP_NTZ NOT NULL,
+    WAREHOUSE_NAME   VARCHAR(256) NOT NULL,
+    QUERY_COUNT      NUMBER,
+    P95_SEC          NUMBER(18,2),
+    REMOTE_SPILL_GB  NUMBER(18,2),
+    AVG_QUEUE_SEC    NUMBER(18,2),
+    REFRESHED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    PRIMARY KEY (HOUR_BUCKET, WAREHOUSE_NAME)
+);
+
+CREATE TABLE IF NOT EXISTS OW_STORAGE_TREND (
+    USAGE_DATE       DATE        NOT NULL PRIMARY KEY,
+    STORAGE_TB       NUMBER(18,4),
+    STAGE_TB         NUMBER(18,4),
+    FAILSAFE_TB      NUMBER(18,4),
+    REFRESHED_AT     TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- SECTION 2: Refresh Tasks (hourly schedule)
+-- ═════════════════════════════════════════════════════════════════════════════
+
+CREATE OR REPLACE TASK TASK_REFRESH_OW_DAILY_CREDITS
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE  = 'USING CRON 5 * * * * America/Chicago'
+  COMMENT   = 'OVERWATCH: Refresh daily credit aggregation from ACCOUNT_USAGE'
+AS
+MERGE INTO OW_DAILY_CREDITS tgt
+USING (
+    SELECT
+        DATE(start_time) AS usage_date,
+        warehouse_name,
+        ROUND(SUM(COALESCE(credits_used_compute, 0)), 4) AS compute_credits,
+        ROUND(SUM(COALESCE(credits_used_cloud_services, 0)), 4) AS cloud_credits,
+        ROUND(SUM(COALESCE(credits_used, 0)), 4) AS total_credits
+    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+    WHERE start_time >= DATEADD('day', -90, CURRENT_TIMESTAMP())
+    GROUP BY usage_date, warehouse_name
+) src
+ON tgt.USAGE_DATE = src.usage_date AND tgt.WAREHOUSE_NAME = src.warehouse_name
+WHEN MATCHED THEN UPDATE SET
+    COMPUTE_CREDITS = src.compute_credits,
+    CLOUD_CREDITS   = src.cloud_credits,
+    TOTAL_CREDITS   = src.total_credits,
+    REFRESHED_AT    = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (USAGE_DATE, WAREHOUSE_NAME, COMPUTE_CREDITS, CLOUD_CREDITS, TOTAL_CREDITS)
+VALUES (src.usage_date, src.warehouse_name, src.compute_credits, src.cloud_credits, src.total_credits);
+
+CREATE OR REPLACE TASK TASK_REFRESH_OW_HOURLY_PRESSURE
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE  = 'USING CRON 15 * * * * America/Chicago'
+  COMMENT   = 'OVERWATCH: Refresh hourly warehouse pressure'
+AS
+MERGE INTO OW_HOURLY_PRESSURE tgt
+USING (
+    SELECT
+        warehouse_name,
+        DATE_TRUNC('hour', start_time) AS hour_bucket,
+        ROUND(SUM(COALESCE(credits_used, 0)), 4) AS hourly_credits
+    FROM SNOWFLAKE.ACCOUNT_USAGE.WAREHOUSE_METERING_HISTORY
+    WHERE start_time >= DATEADD('day', -35, CURRENT_TIMESTAMP())
+    GROUP BY warehouse_name, hour_bucket
+) src
+ON tgt.WAREHOUSE_NAME = src.warehouse_name AND tgt.HOUR_BUCKET = src.hour_bucket
+WHEN MATCHED THEN UPDATE SET
+    HOURLY_CREDITS = src.hourly_credits,
+    REFRESHED_AT   = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (WAREHOUSE_NAME, HOUR_BUCKET, HOURLY_CREDITS)
+VALUES (src.warehouse_name, src.hour_bucket, src.hourly_credits);
+
+CREATE OR REPLACE TASK TASK_REFRESH_OW_TASK_SUMMARY
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE  = 'USING CRON 20 * * * * America/Chicago'
+  COMMENT   = 'OVERWATCH: Refresh task execution summary'
+AS
+MERGE INTO OW_TASK_SUMMARY tgt
+USING (
+    SELECT
+        DATE(scheduled_time) AS run_date,
+        database_name,
+        schema_name,
+        name AS task_name,
+        state,
+        COUNT(*) AS run_count,
+        ROUND(AVG(DATEDIFF('second', scheduled_time, completed_time)), 2) AS avg_duration_sec,
+        ROUND(MAX(DATEDIFF('second', scheduled_time, completed_time)), 2) AS max_duration_sec
+    FROM SNOWFLAKE.ACCOUNT_USAGE.TASK_HISTORY
+    WHERE scheduled_time >= DATEADD('day', -35, CURRENT_TIMESTAMP())
+      AND state IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+    GROUP BY run_date, database_name, schema_name, task_name, state
+) src
+ON tgt.RUN_DATE = src.run_date AND tgt.DATABASE_NAME = src.database_name
+   AND tgt.SCHEMA_NAME = src.schema_name AND tgt.TASK_NAME = src.task_name AND tgt.STATE = src.state
+WHEN MATCHED THEN UPDATE SET
+    RUN_COUNT = src.run_count, AVG_DURATION_SEC = src.avg_duration_sec,
+    MAX_DURATION_SEC = src.max_duration_sec, REFRESHED_AT = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (RUN_DATE, DATABASE_NAME, SCHEMA_NAME, TASK_NAME, STATE, RUN_COUNT, AVG_DURATION_SEC, MAX_DURATION_SEC)
+VALUES (src.run_date, src.database_name, src.schema_name, src.task_name, src.state, src.run_count, src.avg_duration_sec, src.max_duration_sec);
+
+CREATE OR REPLACE TASK TASK_REFRESH_OW_SERVICE_COSTS
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE  = 'USING CRON 30 */2 * * * America/Chicago'
+  COMMENT   = 'OVERWATCH: Refresh service cost breakdown (every 2h)'
+AS
+MERGE INTO OW_SERVICE_COSTS tgt
+USING (
+    SELECT
+        DATE(start_time) AS usage_date,
+        UPPER(COALESCE(service_type, 'UNKNOWN')) AS service_type,
+        ROUND(SUM(COALESCE(credits_used, 0)), 4) AS total_credits
+    FROM SNOWFLAKE.ACCOUNT_USAGE.METERING_HISTORY
+    WHERE start_time >= DATEADD('day', -90, CURRENT_TIMESTAMP())
+    GROUP BY usage_date, service_type
+) src
+ON tgt.USAGE_DATE = src.usage_date AND tgt.SERVICE_TYPE = src.service_type
+WHEN MATCHED THEN UPDATE SET TOTAL_CREDITS = src.total_credits, REFRESHED_AT = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (USAGE_DATE, SERVICE_TYPE, TOTAL_CREDITS)
+VALUES (src.usage_date, src.service_type, src.total_credits);
+
+CREATE OR REPLACE TASK TASK_REFRESH_OW_QUERY_BOTTLENECKS
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE  = 'USING CRON 45 * * * * America/Chicago'
+  COMMENT   = 'OVERWATCH: Refresh query bottleneck hourly stats'
+AS
+MERGE INTO OW_QUERY_BOTTLENECKS tgt
+USING (
+    SELECT
+        DATE_TRUNC('hour', start_time) AS hour_bucket,
+        warehouse_name,
+        COUNT(*) AS query_count,
+        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY total_elapsed_time / 1000.0), 2) AS p95_sec,
+        ROUND(SUM(bytes_spilled_to_remote_storage) / (1024*1024*1024.0), 2) AS remote_spill_gb,
+        ROUND(AVG(queued_overload_time) / 1000.0, 2) AS avg_queue_sec
+    FROM SNOWFLAKE.ACCOUNT_USAGE.QUERY_HISTORY
+    WHERE start_time >= DATEADD('day', -14, CURRENT_TIMESTAMP())
+      AND warehouse_name IS NOT NULL
+      AND execution_status = 'SUCCESS'
+    GROUP BY hour_bucket, warehouse_name
+) src
+ON tgt.HOUR_BUCKET = src.hour_bucket AND tgt.WAREHOUSE_NAME = src.warehouse_name
+WHEN MATCHED THEN UPDATE SET
+    QUERY_COUNT = src.query_count, P95_SEC = src.p95_sec,
+    REMOTE_SPILL_GB = src.remote_spill_gb, AVG_QUEUE_SEC = src.avg_queue_sec,
+    REFRESHED_AT = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (HOUR_BUCKET, WAREHOUSE_NAME, QUERY_COUNT, P95_SEC, REMOTE_SPILL_GB, AVG_QUEUE_SEC)
+VALUES (src.hour_bucket, src.warehouse_name, src.query_count, src.p95_sec, src.remote_spill_gb, src.avg_queue_sec);
+
+CREATE OR REPLACE TASK TASK_REFRESH_OW_STORAGE_TREND
+  WAREHOUSE = COMPUTE_WH
+  SCHEDULE  = 'USING CRON 0 */6 * * * America/Chicago'
+  COMMENT   = 'OVERWATCH: Refresh storage trend (every 6h)'
+AS
+MERGE INTO OW_STORAGE_TREND tgt
+USING (
+    SELECT
+        USAGE_DATE,
+        ROUND(STORAGE_BYTES / (1024.0*1024*1024*1024), 4) AS storage_tb,
+        ROUND(STAGE_BYTES / (1024.0*1024*1024*1024), 4) AS stage_tb,
+        ROUND(FAILSAFE_BYTES / (1024.0*1024*1024*1024), 4) AS failsafe_tb
+    FROM SNOWFLAKE.ACCOUNT_USAGE.STORAGE_USAGE
+    WHERE USAGE_DATE >= DATEADD('day', -90, CURRENT_DATE())
+) src
+ON tgt.USAGE_DATE = src.USAGE_DATE
+WHEN MATCHED THEN UPDATE SET
+    STORAGE_TB = src.storage_tb, STAGE_TB = src.stage_tb,
+    FAILSAFE_TB = src.failsafe_tb, REFRESHED_AT = CURRENT_TIMESTAMP()
+WHEN NOT MATCHED THEN INSERT (USAGE_DATE, STORAGE_TB, STAGE_TB, FAILSAFE_TB)
+VALUES (src.USAGE_DATE, src.storage_tb, src.stage_tb, src.failsafe_tb);
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- SECTION 3: App-facing views (same interface as before)
+-- ═════════════════════════════════════════════════════════════════════════════
+
+CREATE OR REPLACE VIEW V_OVERWATCH_DAILY_CREDITS AS SELECT * FROM OW_DAILY_CREDITS;
+CREATE OR REPLACE VIEW V_OVERWATCH_HOURLY_PRESSURE AS SELECT * FROM OW_HOURLY_PRESSURE;
+CREATE OR REPLACE VIEW V_OVERWATCH_TASK_SUMMARY AS SELECT * FROM OW_TASK_SUMMARY;
+CREATE OR REPLACE VIEW V_OVERWATCH_SERVICE_COSTS AS SELECT * FROM OW_SERVICE_COSTS;
+CREATE OR REPLACE VIEW V_OVERWATCH_QUERY_BOTTLENECKS AS SELECT * FROM OW_QUERY_BOTTLENECKS;
+CREATE OR REPLACE VIEW V_OVERWATCH_STORAGE_TREND AS SELECT * FROM OW_STORAGE_TREND;
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- SECTION 4: Resume tasks (they start in SUSPENDED state by default)
+-- ═════════════════════════════════════════════════════════════════════════════
+
+ALTER TASK TASK_REFRESH_OW_DAILY_CREDITS RESUME;
+ALTER TASK TASK_REFRESH_OW_HOURLY_PRESSURE RESUME;
+ALTER TASK TASK_REFRESH_OW_TASK_SUMMARY RESUME;
+ALTER TASK TASK_REFRESH_OW_SERVICE_COSTS RESUME;
+ALTER TASK TASK_REFRESH_OW_QUERY_BOTTLENECKS RESUME;
+ALTER TASK TASK_REFRESH_OW_STORAGE_TREND RESUME;
+
+-- ═════════════════════════════════════════════════════════════════════════════
+-- SECTION 5: Initial seed (run Tasks immediately to populate tables now)
+-- ═════════════════════════════════════════════════════════════════════════════
+
+EXECUTE TASK TASK_REFRESH_OW_DAILY_CREDITS;
+EXECUTE TASK TASK_REFRESH_OW_HOURLY_PRESSURE;
+EXECUTE TASK TASK_REFRESH_OW_TASK_SUMMARY;
+EXECUTE TASK TASK_REFRESH_OW_SERVICE_COSTS;
+EXECUTE TASK TASK_REFRESH_OW_QUERY_BOTTLENECKS;
+EXECUTE TASK TASK_REFRESH_OW_STORAGE_TREND;
+
+-- ─── Migration ledger ────────────────────────────────────────────────────────
+MERGE INTO OVERWATCH_SCHEMA_MIGRATION tgt
+USING (SELECT '2026.06.10-precompute-task-pattern' AS MIGRATION_VERSION,
+              'Task+Table pre-computation layer (replaces failed DT approach)' AS MIGRATION_NAME,
+              'snowflake/PRECOMPUTE.sql' AS SOURCE_FILE) src
+ON tgt.MIGRATION_VERSION = src.MIGRATION_VERSION
+WHEN NOT MATCHED THEN INSERT (MIGRATION_VERSION, MIGRATION_NAME, SOURCE_FILE)
+VALUES (src.MIGRATION_VERSION, src.MIGRATION_NAME, src.SOURCE_FILE);
