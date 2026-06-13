@@ -1,0 +1,34 @@
+# -----------------------------------------------------------------------------
+# OVERWATCH - Streamlit-in-Snowflake (SiS) Deployment Manifest
+# Account:   ALFA Insurance
+# App:       DBA_MAINT_DB.OVERWATCH.OVERWATCH_CODEX
+# Warehouse: OVERWATCH_WH (dedicated, XSMALL, 60s auto-suspend, resource monitored)
+#
+# Deployment:
+#   snow streamlit deploy --replace
+#
+# Prerequisites:
+#   1. Run snowflake/DEPLOY.sql as ACCOUNTADMIN (creates DB, schema, warehouse, roles)
+#   2. Optionally run snowflake/PRECOMPUTE.sql for Dynamic Tables (Enterprise Edition)
+#   3. Grant OVERWATCH_APP_ROLE to the Streamlit app owner
+# -----------------------------------------------------------------------------
+
+definition_version: 1
+entities:
+  streamlit_app:
+    type: streamlit
+    identifier:
+      database: DBA_MAINT_DB
+      schema: OVERWATCH
+      name: OVERWATCH_CODEX
+    title: OVERWATCH_CODEX
+    query_warehouse: OVERWATCH_WH
+    main_file: app.py
+    artifacts:
+      - environment.yml
+      - pyproject.toml
+      - app.py
+      - config.py
+      - theme.py
+      - utils/
+      - sections/
