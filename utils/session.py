@@ -1,0 +1,159 @@
+"""Snowflake session management for OVERWATCH."""
+
+from datetime import datetime
+
+import streamlit as st
+
+
+# How long before we force a session health check.
+_SESSION_TTL_MINUTES = 90
+
+# Query tag applied to all OVERWATCH SQL for attribution and filtering.
+_QUERY_TAG = "OVERWATCH"
+
+# Session statement timeout in seconds. This stays under a common 1000s
+# warehouse timeout so OVERWATCH gets cleaner failures for long scans.
+_STMT_TIMEOUT_SECONDS = 840
+
+
+def _has_streamlit_snowflake_secrets() -> bool:
+    """Return True when Streamlit secrets define a Snowflake connection."""
+    try:
+        connections = st.secrets.get("connections", {})
+        snowflake_cfg = connections.get("snowflake", {}) if connections else {}
+        return bool(snowflake_cfg)
+    except Exception:
+        return False
+
+
+def _make_streamlit_connection_session():
+    """Create a Snowpark session from Streamlit connection secrets."""
+    conn = st.connection("snowflake")
+    return conn.session()
+
+
+def _make_session():
+    """Create a Snowflake session and apply OVERWATCH session parameters."""
+    if _has_streamlit_snowflake_secrets():
+        try:
+            sess = _make_streamlit_connection_session()
+        except Exception:
+            st.warning(
+                "Snowflake connection is not available from Streamlit secrets. "
+                "Check the configured Snowflake account, user, role, warehouse, database, and schema."
+            )
+            st.stop()
+    else:
+        try:
+            # Streamlit-in-Snowflake injects the active Snowpark session.
+            from snowflake.snowpark.context import get_active_session
+
+            sess = get_active_session()
+        except Exception:
+            try:
+                sess = _make_streamlit_connection_session()
+            except Exception:
+                st.warning(
+                    "Snowflake connection is not available in this environment. "
+                    "Deploy OVERWATCH inside Snowflake Streamlit or configure a Streamlit Snowflake connection."
+                )
+                st.stop()
+
+    try:
+        safe_tag = _QUERY_TAG.replace("'", "''")
+        sess.sql(
+            f"ALTER SESSION SET "
+            f"QUERY_TAG = '{safe_tag}', "
+            f"STATEMENT_TIMEOUT_IN_SECONDS = {int(_STMT_TIMEOUT_SECONDS)}, "
+            f"TIMEZONE = 'UTC'"
+        ).collect()
+        st.session_state["_overwatch_active_query_tag"] = _QUERY_TAG
+    except Exception:
+        pass
+
+    _capture_current_role(sess)
+    return sess
+
+
+def _capture_current_role(sess) -> str:
+    """Cache CURRENT_ROLE for role-based navigation without blocking startup."""
+    try:
+        rows = sess.sql("SELECT CURRENT_ROLE() AS R").collect()
+        role = rows[0]["R"] if rows else ""
+        role = str(role or "").upper()
+        st.session_state["_overwatch_current_role"] = role
+        return role
+    except Exception:
+        st.session_state.setdefault("_overwatch_current_role", "")
+        return ""
+
+
+def _session_is_alive(sess) -> bool:
+    """Return False if the Snowflake session has been recycled or expired."""
+    try:
+        sess.sql("SELECT 1").collect()
+        return True
+    except Exception:
+        return False
+
+
+def get_session():
+    """Return a live, validated Snowflake session."""
+    now = datetime.now()
+    last_created = st.session_state.get("_sf_session_created_at")
+    needs_check = False
+    if last_created:
+        age_min = (now - last_created).total_seconds() / 60
+        needs_check = age_min >= _SESSION_TTL_MINUTES
+    elif "sf_session" in st.session_state:
+        st.session_state["_sf_session_created_at"] = now
+
+    if needs_check and "sf_session" in st.session_state:
+        if not _session_is_alive(st.session_state["sf_session"]):
+            st.session_state.pop("sf_session", None)
+        st.session_state["_sf_session_created_at"] = now
+
+    if "sf_session" not in st.session_state:
+        sess = _make_session()
+        st.session_state["sf_session"] = sess
+        st.session_state["_sf_session_created_at"] = now
+    elif "_overwatch_current_role" not in st.session_state:
+        _capture_current_role(st.session_state["sf_session"])
+
+    return st.session_state["sf_session"]
+
+
+def snowflake_connection_known_unavailable() -> bool:
+    """Return True when startup already proved Snowflake is unavailable."""
+    return bool(
+        st.session_state.get("_overwatch_connection_unavailable")
+        or st.session_state.get("_overwatch_connection_available") is False
+    )
+
+
+def get_session_for_action(
+    action: str,
+    *,
+    surface: str = "OVERWATCH",
+    offline_note: str = "Static setup and source summaries remain available without a connection.",
+):
+    """Return a session for explicit live actions, or None with a consistent UI guard."""
+    if snowflake_connection_known_unavailable():
+        st.info(f"Snowflake connection is required to {action}. {offline_note}")
+        return None
+    try:
+        return get_session()
+    except BaseException as exc:
+        if exc.__class__.__name__ != "StopException":
+            raise
+        st.info(f"Snowflake connection is required to {action}. {offline_note}")
+        st.session_state["_overwatch_connection_unavailable"] = True
+        st.session_state["_overwatch_connection_available"] = False
+        st.session_state["_overwatch_connection_surface"] = surface
+        return None
+
+
+def invalidate_session():
+    """Force-drop the cached Snowflake session."""
+    st.session_state.pop("sf_session", None)
+    st.session_state.pop("_sf_session_created_at", None)
